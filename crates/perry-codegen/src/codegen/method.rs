@@ -626,6 +626,7 @@ pub(super) fn compile_method(
             .collect(),
         versioned_indexed_loop_facts: Vec::new(),
         stable_packed_loop_facts: Vec::new(),
+        prelowered_zero_for_counter: None,
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this,
         proven_shape_params: pshape_arg_plan
@@ -1774,6 +1775,7 @@ pub(super) fn compile_static_method(
         trusted_array_param_handles: HashMap::new(),
         versioned_indexed_loop_facts: Vec::new(),
         stable_packed_loop_facts: Vec::new(),
+        prelowered_zero_for_counter: None,
         pshape_tower_routable: &cross_module.pshape_tower_routable,
         proven_this: None,
         proven_shape_params: std::collections::HashMap::new(),

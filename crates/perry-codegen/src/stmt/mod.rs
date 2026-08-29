@@ -217,7 +217,16 @@ fn lower_stmts_inner(ctx: &mut FnCtx<'_>, stmts: &[Stmt], emit_shadow_clears: bo
             }
             continue;
         }
-        lower_stmt(ctx, &stmts[i])?;
+        // #9052 lowers a multi-declarator lexical `for` head into adjacent
+        // prelude Lets so their initializers retain source order. Preserve the
+        // narrow zero-counter fact that loop versioners previously read from
+        // `For::init`: find the exact preceding declaration and reject any
+        // intervening initializer that writes the counter.
+        let previous_prelowered_counter = ctx.prelowered_zero_for_counter;
+        ctx.prelowered_zero_for_counter = prelowered_zero_for_counter(stmts, i);
+        let lowered = lower_stmt(ctx, &stmts[i]);
+        ctx.prelowered_zero_for_counter = previous_prelowered_counter;
+        lowered?;
         // Representation-selection Phase 2: a TOP-LEVEL `Stmt::Let` of a
         // pre-pass-proven typed-array binding makes the binding "ready" — the
         // dominance mirror of the collector's sequential judgment. Later call
@@ -247,6 +256,53 @@ fn lower_stmts_inner(ctx: &mut FnCtx<'_>, stmts: &[Stmt], emit_shadow_clears: bo
         i += 1;
     }
     Ok(())
+}
+
+fn prelowered_zero_for_counter(stmts: &[Stmt], for_index: usize) -> Option<u32> {
+    let Stmt::For {
+        init: None,
+        condition:
+            Some(perry_hir::Expr::Compare {
+                op: perry_hir::CompareOp::Lt,
+                left,
+                ..
+            }),
+        update:
+            Some(perry_hir::Expr::Update {
+                id: update_id,
+                op: perry_hir::UpdateOp::Increment,
+                ..
+            }),
+        ..
+    } = &stmts[for_index]
+    else {
+        return None;
+    };
+    let perry_hir::Expr::LocalGet(counter_id) = left.as_ref() else {
+        return None;
+    };
+    if update_id != counter_id {
+        return None;
+    }
+
+    let mut prelude_start = for_index;
+    while prelude_start > 0 && matches!(stmts[prelude_start - 1], Stmt::Let { .. }) {
+        prelude_start -= 1;
+    }
+    let declaration_index = (prelude_start..for_index).find(|&index| {
+        matches!(
+            &stmts[index],
+            Stmt::Let {
+                id,
+                init: Some(perry_hir::Expr::Integer(0)),
+                ..
+            } if id == counter_id
+        )
+    })?;
+    if loops::stmts_mutate_local(&stmts[declaration_index + 1..for_index], *counter_id) {
+        return None;
+    }
+    Some(*counter_id)
 }
 
 pub(crate) fn emit_shadow_clears_after_stmt(ctx: &mut FnCtx<'_>, stmt_idx: usize) {

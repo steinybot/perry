@@ -1160,6 +1160,11 @@ pub(crate) struct FnCtx<'a> {
     /// is refreshed by the iteration-entry check before direct loads.
     pub stable_packed_loop_facts: Vec<StablePackedLoopFact>,
 
+    /// Counter initializer recovered from an immediately preceding HIR
+    /// prelude for a classic `for` whose multi-declarator lexical head was
+    /// lowered out of `For::init`. Set only while that exact `For` is lowered.
+    pub prelowered_zero_for_counter: Option<u32>,
+
     /// #7142: the subset of [`Self::pshape_methods`] the class-id dispatch
     /// tower may route to. A profitability filter only — see
     /// `collectors::pshape_tower_route_profitable`. Soundness at that site comes

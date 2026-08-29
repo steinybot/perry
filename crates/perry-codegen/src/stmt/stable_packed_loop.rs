@@ -448,12 +448,13 @@ fn match_candidate(
     if !ctx.pending_labels.is_empty() {
         return None;
     }
-    let counter_id = match init? {
-        Stmt::Let {
+    let counter_id = match init {
+        Some(Stmt::Let {
             id,
             init: Some(Expr::Integer(0)),
             ..
-        } => *id,
+        }) => *id,
+        None => ctx.prelowered_zero_for_counter?,
         _ => return None,
     };
     if !matches!(
