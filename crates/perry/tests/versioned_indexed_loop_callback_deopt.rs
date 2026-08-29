@@ -41,32 +41,42 @@ fn workspace_root() -> PathBuf {
         .expect("canonicalize workspace root")
 }
 
-fn runtime_dir() -> PathBuf {
+fn target_release_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
+        .join("release")
+}
+
+fn ensure_runtime_archives() {
     static BUILD_RUNTIME: Once = Once::new();
     BUILD_RUNTIME.call_once(|| {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut command = Command::new(cargo);
-        command.current_dir(workspace_root()).arg("build");
+        command
+            .current_dir(workspace_root())
+            .arg("build")
+            .arg("--release");
         remove_gc_env_overrides(&mut command);
-        if !cfg!(debug_assertions) {
-            command.arg("--release");
-        }
         let build = command
-            .args(["-p", "perry-runtime-static"])
+            .args(["-p", "perry-runtime-static", "-p", "perry-stdlib-static"])
             .output()
-            .expect("build static runtime archive");
+            .expect("build static runtime archives");
         assert!(
             build.status.success(),
-            "static runtime build failed\nstdout:\n{}\nstderr:\n{}",
+            "static runtime archive build failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
     });
+}
 
-    perry_bin()
-        .parent()
-        .expect("Perry binary directory")
-        .to_path_buf()
+fn runtime_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PERRY_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
+    ensure_runtime_archives();
+    target_release_dir()
 }
 
 fn run_fixture(binary: &Path, force_evacuation: bool) -> Output {
