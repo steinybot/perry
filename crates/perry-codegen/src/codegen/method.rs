@@ -549,6 +549,7 @@ pub(super) fn compile_method(
         class_field_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: index_i32_param_slots,
+        numeric_accumulator_f64_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
@@ -780,6 +781,18 @@ pub(super) fn compile_method(
         // derived and must wait until the synthesized super call below.
         if dynamic_parent_owner.is_none() {
             let init_mode = if class.extends_name.is_some() {
+                crate::lower_call::FieldInitMode::AncestorsOnly
+            } else if class.extends_expr.is_some() {
+                // Dynamic parent (`class X extends someExpr`) with an OWN
+                // ctor: the body's `super()` lowering stages the self fields
+                // after the parent returns (spec order). Staging `All` here
+                // ran every initializer TWICE — silent double side effects
+                // for public fields, and a thrown "initialize twice" for
+                // private ones (pi's startup died on the mixin pattern).
+                // The static ancestor chain of a purely dynamic parent is
+                // empty, so AncestorsOnly stages nothing, which is correct:
+                // everything above the edge belongs to the runtime parent
+                // constructor.
                 crate::lower_call::FieldInitMode::AncestorsOnly
             } else {
                 crate::lower_call::FieldInitMode::All
@@ -1312,8 +1325,9 @@ pub(super) fn compile_method(
         let lowered = llmod
             .function_mut(lowered_function_index)
             .expect("just-lowered method function");
-        if super::helpers::guarded_specialization_fits_preinline_budget(
+        if super::helpers::guarded_specialization_admits_preinline(
             lowered.estimated_ir_bytes(),
+            method.body.len(),
         ) {
             lowered.pre_statepoint_inline = true;
         }
@@ -1702,6 +1716,7 @@ pub(super) fn compile_static_method(
         class_field_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        numeric_accumulator_f64_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;

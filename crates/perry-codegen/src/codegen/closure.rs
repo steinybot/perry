@@ -976,6 +976,69 @@ pub(super) fn compile_closure(
             }
         }
         trusted
+    } else if crate::expr::box_capture_entry_cells_enabled()
+        && !is_async
+        // Match the repsel context gate: generator wrappers and CPS async-step
+        // closures route locals through shared cells, and their entry blocks
+        // have re-entry semantics this cache has not been audited against.
+        && !cross_module.local_generator_funcs.contains(&func_id)
+        && !cross_module.async_step_closures.contains(&func_id)
+    {
+        // The PUBLIC body's variant of the cache above (#9016 follow-up). The
+        // dispatcher has validated nothing here, so each cached pointer is
+        // resolved through `js_box_capture_cell_ptr`, which answers the box's
+        // own (never-moving) cell for a registered pointer and a shared
+        // immutable `undefined` cell otherwise — per-read behaviour is then
+        // identical to `js_box_get_bits` in both cases. Admission is
+        // deliberately narrow:
+        //
+        // * only bindings this body NEVER writes — the `LocalSet`/`Update`
+        //   trusted arms store straight through the cached pointer, which must
+        //   never reach the shared fallback cell;
+        // * only bindings read more than once or read inside a loop — a
+        //   single straight-line read pays the same either way, and a read on
+        //   a never-taken branch must not become an unconditional entry call;
+        // * not in async bodies — their entry SSA values do not survive a
+        //   suspension.
+        //
+        // The cell CONTENTS are still loaded per use, so a write through any
+        // other closure sharing the box stays visible; only the pointer — and
+        // the per-read registry probe `is_registered_box_ptr`, 1.45% of the
+        // wolf-ecs entity cycle — is hoisted to entry.
+        let mut cached = HashMap::new();
+        let mut boxed_captures: Vec<_> = closure_captures
+            .iter()
+            .filter(|(id, _)| closure_boxed_vars.contains(id))
+            .map(|(id, index)| (*id, *index))
+            .collect();
+        boxed_captures.sort_unstable_by_key(|(_, index)| *index);
+        if !boxed_captures.is_empty() {
+            let uses = super::closure_collect::collect_capture_use(
+                body,
+                boxed_captures.iter().map(|(id, _)| *id),
+            );
+            boxed_captures.retain(|(id, _)| {
+                uses.get(id)
+                    .is_some_and(|u| u.writes == 0 && (u.reads >= 2 || u.loop_reads >= 1))
+            });
+        }
+        if !boxed_captures.is_empty() {
+            let header_size =
+                crate::target_layout::closure_header_size_bytes(&cross_module.target_triple)
+                    .to_string();
+            let blk = lf.block_mut(0).expect("closure body has an entry block");
+            let closure_ptr = blk.inttoptr(I64, "%this_closure");
+            let captures_base = blk.gep(I8, &closure_ptr, &[(I64, &header_size)]);
+            for (id, index) in boxed_captures {
+                let index = index.to_string();
+                let capture_slot = blk.gep(I64, &captures_base, &[(I64, &index)]);
+                let bits = blk.load(I64, &capture_slot);
+                let cell_bits = blk.call(I64, "js_box_capture_cell_ptr", &[(I64, &bits)]);
+                let ptr = blk.inttoptr(I64, &cell_bits);
+                cached.insert(id, crate::expr::TrustedBoxCapturePtr { bits, ptr });
+            }
+        }
+        cached
     } else {
         HashMap::new()
     };
@@ -1125,6 +1188,7 @@ pub(super) fn compile_closure(
         class_field_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        numeric_accumulator_f64_slots: HashMap::new(),
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         // #7109 split the FIELD out of `repsel_context_allows_canonical_i32`;
@@ -1243,6 +1307,23 @@ pub(super) fn compile_closure(
         Some(body),
         super::arguments::ArgumentsCallee::CurrentClosure,
     );
+
+    // #9060 follow-up: resolve loop-called immutable callee bindings once at
+    // entry — parameters, captured bindings, and module globals (the
+    // module-wide reassignment oracle is in scope here). `%this_closure` is a
+    // live parameter of every closure body, so capture-slot reads are direct.
+    // Skipped for async bodies: entry SSA values do not survive the CPS
+    // rewrite.
+    if !is_async {
+        let param_ids: std::collections::HashSet<u32> = params.iter().map(|p| p.id).collect();
+        super::helpers::emit_callee_binding_resolutions(
+            &mut ctx,
+            body,
+            &param_ids,
+            Some(module_reassigned_locals),
+            true,
+        );
+    }
 
     if is_async {
         stmt::lower_async_rejecting_stmts(&mut ctx, body)
