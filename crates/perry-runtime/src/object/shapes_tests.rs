@@ -143,6 +143,44 @@ mod c3c_tests {
         }
     }
 
+    /// A canonical keys pointer is not sufficient proof when its physical
+    /// length has drifted. The preinstalled fast path must reject the stale
+    /// descriptor so allocation can use the exact mint-and-validate fallback.
+    #[test]
+    fn preinstalled_shape_rejects_same_pointer_key_count_drift() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        const CID: u32 = 0x0C3C_7905;
+        let packed = b"drifted";
+        let keys =
+            crate::object::js_build_class_keys_array(CID, 1, packed.as_ptr(), packed.len() as u32);
+        let shape_id = js_object_shape_id_for_keys(keys as usize as u64, 1);
+        let payload = std::mem::size_of::<crate::object::ObjectHeader>()
+            + crate::object::INLINE_SLOT_FLOOR * std::mem::size_of::<crate::value::JSValue>();
+        let obj = crate::arena::arena_alloc_gc(payload, 8, crate::gc::GC_TYPE_OBJECT)
+            as *mut crate::object::ObjectHeader;
+
+        unsafe {
+            (*obj).class_id = CID;
+            (*obj).parent_class_id = 0;
+            (*obj).meta = std::ptr::null_mut();
+            (*keys).length = 0;
+
+            assert!(
+                !try_birth_stamp_preinstalled_shape(obj, shape_id, keys, 1),
+                "same pointer with a different physical key count must miss"
+            );
+            assert_eq!(
+                (*obj).parent_class_id,
+                0,
+                "a miss must not stamp the newborn"
+            );
+
+            // Restore the immortal cached fixture for any later test sharing
+            // this process; its key slot was never modified.
+            (*keys).length = 1;
+        }
+    }
+
     /// Learned/hidden inline capacity can legitimately exceed the public key
     /// count. A module-init id for the narrow shape must fail closed, and the
     /// existing allocator fallback must publish and retain the exact wider

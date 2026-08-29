@@ -33,11 +33,11 @@ fn workspace_root() -> PathBuf {
         .expect("canonicalize workspace root")
 }
 
-fn target_debug_dir() -> PathBuf {
+fn target_release_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"))
-        .join("debug")
+        .join("release")
 }
 
 fn ensure_runtime_archive() {
@@ -53,6 +53,7 @@ fn ensure_runtime_archive() {
         let build = Command::new(cargo)
             .current_dir(workspace_root())
             .arg("build")
+            .arg("--release")
             .arg("-p")
             .arg("perry-runtime-static")
             .arg("-p")
@@ -69,8 +70,11 @@ fn ensure_runtime_archive() {
 }
 
 fn runtime_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PERRY_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
     ensure_runtime_archive();
-    target_debug_dir()
+    target_release_dir()
 }
 
 /// `npm install` the given packages into `root`, then opt every installed

@@ -1169,7 +1169,13 @@ pub(crate) unsafe fn try_birth_stamp_preinstalled_shape(
     let Some(descriptor) = shape_descriptor_by_id(runtime_shape_id) else {
         return false;
     };
+    let physical_key_count = if keys.is_null() {
+        0
+    } else {
+        crate::array::keys_array_len_capped_to_capacity(keys) as u32
+    };
     if descriptor.keys != keys as u64
+        || descriptor.logical_key_count != physical_key_count
         || descriptor.live_inline_slot_count != live_inline_slot_count
         || descriptor.semantic_generation != 0
         || descriptor.object_kind != ShapeObjectKind::Ordinary
@@ -1496,6 +1502,7 @@ unsafe fn object_header_key_count(obj: *const crate::object::ObjectHeader) -> u3
 /// keys edge the receiver is about to carry". The bound cannot disagree with
 /// itself.
 #[inline]
+#[track_caller]
 pub(crate) unsafe fn debug_assert_object_shape_parity(obj: *const crate::object::ObjectHeader) {
     debug_assert_object_shape_parity_for_keys(obj, crate::object::object_keys_array(obj));
 }
@@ -1506,6 +1513,7 @@ pub(crate) unsafe fn debug_assert_object_shape_parity(obj: *const crate::object:
 /// (that is what makes the keys mutation mint-then-stamp), so for that one
 /// window the authoritative edge is the caller's argument, not the header word.
 #[inline]
+#[track_caller]
 pub(crate) unsafe fn debug_assert_object_shape_parity_for_keys(
     obj: *const crate::object::ObjectHeader,
     keys: *mut ArrayHeader,
@@ -1517,10 +1525,13 @@ pub(crate) unsafe fn debug_assert_object_shape_parity_for_keys(
         } else {
             crate::array::keys_array_len_capped_to_capacity(keys) as u32
         };
+        let descriptor = shape_descriptor_by_id(id);
         debug_assert!(
-            shape_descriptor_by_id(id)
+            descriptor
                 .is_some_and(|d| { d.keys == keys as u64 && d.logical_key_count == key_count }),
-            "published ShapeId disagrees with authoritative ObjectHeader facts"
+            "published ShapeId disagrees with authoritative ObjectHeader facts: \
+             id={id:#010x} obj={obj:p} keys={keys:p} key_count={key_count} \
+             descriptor={descriptor:?}"
         );
     }
 }
