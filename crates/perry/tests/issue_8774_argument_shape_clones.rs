@@ -356,8 +356,14 @@ fn guard_failures_match_node_and_unsafe_parameters_stay_generic() {
         !ir.contains(&format!("call double @{alias_clone}(")),
         "a receiver/argument alias must never enter the argument clone:\n{ir}"
     );
+    // This fixture imports proxy/delete/defineProperty mutations, so the fresh
+    // exact local may use the argument clone only behind a runtime shape guard.
+    // Pin both sides of that dispatch: eliding the generic fallback here would
+    // miscompile the guard-failure cases exercised above.
+    let clone_call = "call double @perry_method_main_ts__Registry__read$pshape_args(";
+    let generic_call = "call double @perry_method_main_ts__Registry__read(";
     assert!(
-        !ir.contains("pshape_arg.fallback"),
-        "all selected semantic-fixture routes originate at fresh contained locals"
+        ir.contains("pshape_arg.fallback") && ir.contains(clone_call) && ir.contains(generic_call),
+        "barrier-carrying argument route must retain its clone guard and generic fallback:\n{ir}"
     );
 }
