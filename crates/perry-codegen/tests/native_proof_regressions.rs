@@ -1568,9 +1568,13 @@ fn pod_field_read_after_dynamic_materialization_uses_dynamic_numeric_sub() {
         ir.contains("call double @js_dynamic_sub"),
         "materialized POD field reads must use coercing dynamic arithmetic:\n{ir}"
     );
+    // The `fsub` may appear, but only downstream of a runtime tag test: since
+    // the guarded-arithmetic change, `-` emits a diamond whose cold arm is the
+    // `js_dynamic_sub` asserted above. What must never happen — boxed bits
+    // reaching raw arithmetic on a static claim alone — is what is asserted.
     assert!(
-        !ir.contains("fsub double"),
-        "materialized POD field reads must not feed boxed JSValue bits into raw arithmetic:\n{ir}"
+        !ir.contains("fsub double") || ir.contains("guarded_arith.numeric"),
+        "materialized POD field reads must not feed boxed JSValue bits into UNGUARDED raw arithmetic:\n{ir}"
     );
 }
 
@@ -12758,9 +12762,13 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
              keep the possibly boxed `+` result on semantically dynamic multiplication:\n\
              {pshape_ir}"
         );
+        // Annotation-only operands still must not reach raw multiplication on
+        // the strength of the annotation. They may reach it after a runtime
+        // tag test, which is the same standard `+` has held since #9159 and
+        // which `*` now shares: the diamond's cold arm keeps `js_dynamic_mul`.
         assert!(
-            !pshape_ir.contains(" fmul "),
-            "annotation-only operands must not reach raw f64 multiplication in `$pshape`:\n{pshape_ir}"
+            !pshape_ir.contains(" fmul ") || pshape_ir.contains("guarded_arith.numeric"),
+            "annotation-only operands must not reach UNGUARDED raw f64 multiplication in `$pshape`:\n{pshape_ir}"
         );
     }
     assert!(
@@ -15276,8 +15284,8 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
         rejected
             .matches("call double @js_put_value_set_ic_miss")
             .count(),
-        20,
-        "the bounded rejection must preserve all four cache miss entries for all five semantic write sites:\n{rejected}"
+        25,
+        "the bounded rejection must preserve all five fallback entries for all five semantic write sites:\n{rejected}"
     );
 
     let mut nonfinite_body = loop_body(1);
@@ -15605,3 +15613,49 @@ mod integer_modulo;
 
 #[path = "native_proof_regressions/math_mul_fastpath.rs"]
 mod math_mul_fastpath;
+
+// `sum = sum + arr[i] + arr[j]` in a nested counted loop (suite
+// `10_nested_loops`): the inner clone reads `arr` at its own counter AND at the
+// outer loop's. The foreign read used to fall to the typed-feedback tier — a
+// registered guard CALL plus a boxed fallback per element — while the sibling
+// read beside it was a raw slot load. It now takes the same raw load behind one
+// inline bounds check, exiting to the clone's existing side exit when it fails.
+#[test]
+fn packed_clone_reads_a_foreign_counter_without_the_feedback_call() {
+    let add = |left: Expr, right: Expr| Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let body = vec![
+        number_array_let(1, "arr", vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        Stmt::Let {
+            id: 2,
+            name: "sum".to_string(),
+            ty: Type::Number,
+            mutable: true,
+            init: Some(Expr::Number(0.0)),
+        },
+        for_loop(
+            3,
+            length(1),
+            vec![for_loop(
+                4,
+                length(1),
+                vec![Stmt::Expr(Expr::LocalSet(
+                    2,
+                    Box::new(add(
+                        add(local(2), index_get(1, local(3))),
+                        index_get(1, local(4)),
+                    )),
+                ))],
+            )],
+        ),
+        Stmt::Return(Some(local(2))),
+    ];
+    let ir = compile_ir("packed_clone_foreign_read.ts", body);
+    assert!(
+        ir.contains("packed_f64_loop.foreign.inbounds"),
+        "the foreign-counter read should take the bounds-checked clone load:\n{ir}"
+    );
+}

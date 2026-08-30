@@ -134,6 +134,7 @@ pub(crate) use v8_interop::{
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_on_block,
     emit_jsvalue_slot_store_pointer_tested, emit_jsvalue_slot_store_scalar_aware_on_block,
+    emit_jsvalue_slot_store_scalar_aware_with_flags_on_block,
     emit_jsvalue_slot_store_with_flags_on_block, emit_jsvalue_slot_store_with_value_bits_on_block,
     emit_layout_note_slot_on_block, emit_may_carry_heap_pointer_check,
     emit_root_heap_word_store_on_block, emit_root_nanbox_store_on_block, emit_write_barrier,
@@ -998,6 +999,11 @@ pub(crate) struct FnCtx<'a> {
     /// `i` in bounds.
     pub packed_f64_loop_facts: Vec<PackedF64LoopFact>,
     pub masked_window_array_facts: Vec<MaskedWindowArrayFact>,
+    /// Scoped facts established by the string-array masked-window loop
+    /// versioner. The entry guard proves every slot in the window is an
+    /// in-bounds SSO-or-heap string, so reads may bypass ordinary array
+    /// dispatch and string `.length` needs no dynamic miss arm.
+    pub string_window_array_facts: Vec<StringWindowArrayFact>,
     /// #6750 follow-up: locals currently flow-refined to Number inside a
     /// masked-window region fast copy — their shadow slots were cleared at
     /// the refinement point and per-statement shadow updates are suppressed
@@ -2066,6 +2072,20 @@ pub(crate) struct MaskedWindowArrayFact {
     pub allows_stores: bool,
 }
 
+/// Read-only masked-index window over a plain array of boxed strings.
+///
+/// The fast-loop preheader validates the receiver shape, bounds, and every
+/// slot's string tag. Its body is call/store-free apart from the accumulator
+/// update, so the proof remains true until the scoped clone exits.
+#[derive(Debug, Clone)]
+pub(crate) struct StringWindowArrayFact {
+    pub array_local_id: u32,
+    pub scope_id: u32,
+    pub min_idx: i64,
+    pub max_idx_exclusive: i64,
+    pub numeric_accumulator: u32,
+}
+
 /// #5093: one fact per (receiver, versioned loop). See
 /// `FnCtx::class_field_loop_facts` for the safety argument.
 #[derive(Debug, Clone)]
@@ -2705,6 +2725,8 @@ mod index_get_claim_tests;
 pub(crate) mod masked_window;
 #[cfg(test)]
 mod null_default_numeric_add_tests;
+mod string_length;
+pub(crate) mod string_window;
 
 mod ptr_numarray_access;
 mod ta_param_f64_read;

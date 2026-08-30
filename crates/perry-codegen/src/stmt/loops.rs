@@ -4103,6 +4103,13 @@ fn lower_object_array_write_versioned_for(
 
     let fast_call_free = (fast_scan_start..ctx.func.num_blocks())
         .all(|idx| !ctx.func.blocks()[idx].contains_gc_unsafe_call());
+    if !fast_call_free {
+        // Reached when the matcher ADMITTED the loop but an emitted block in
+        // the clone carries a call, so the clone is built and never entered.
+        // That is invisible from the matcher's own rejection reasons, which is
+        // why it gets its own trace line.
+        let _ = packed_loop_reject("fast_clone_not_call_free");
+    }
     ctx.current_block = preheader_idx;
     let mut guard_ok = ctx.block().icmp_ne(I64, &packed_slots, "0");
     for (g_packed, _) in &extra_guards {
@@ -4753,6 +4760,22 @@ fn record_loop_array_length_effect(
     );
 }
 
+/// Diagnostic for `match_packed_f64_versioned_loop`'s rejection points.
+///
+/// The admission decision is a chain of independent conditions, and when a loop
+/// unexpectedly stays on the generic path there is no way to tell WHICH one
+/// declined it by reading the code — three separate attempts on #9151 each
+/// found a different gate by guessing. `PERRY_PACKED_LOOP_TRACE=1` prints the
+/// reason instead, turning that into one run.
+fn packed_loop_reject(reason: &'static str) -> Option<PackedF64VersionedLoop> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("PERRY_PACKED_LOOP_TRACE").as_deref() == Ok("1")) {
+        eprintln!("[packed-loop] rejected: {reason}");
+    }
+    None
+}
+
 fn match_packed_f64_versioned_loop(
     ctx: &FnCtx<'_>,
     init: Option<&perry_hir::Stmt>,
@@ -4761,7 +4784,7 @@ fn match_packed_f64_versioned_loop(
     body: &[Stmt],
 ) -> Option<PackedF64VersionedLoop> {
     if !ctx.pending_labels.is_empty() {
-        return None;
+        return packed_loop_reject("pending_labels");
     }
     let ordinary_hoist =
         condition.and_then(|cond| classify_for_length_hoist(ctx, cond, update, body));
@@ -4769,13 +4792,13 @@ fn match_packed_f64_versioned_loop(
         condition.and_then(|cond| classify_for_length_hoist_impl(ctx, cond, update, body, true))
     })?;
     if !matches!(hoist.op, perry_hir::CompareOp::Lt) || hoist.lhs_addend != 0 {
-        return None;
+        return packed_loop_reject("compare_op_not_lt");
     }
     if !ctx.integer_locals.contains(&hoist.counter_id)
         || !loop_counter_bounds_are_safe(ctx, hoist.counter_id, update, body)
         || !loop_counter_entry_i32_range_is_safe(init, hoist.counter_id)
     {
-        return None;
+        return packed_loop_reject("counter_not_integer");
     }
     let store_array_kind =
         supported_packed_numeric_loop_store_kind(ctx, body, hoist.arr_id, hoist.counter_id);
@@ -4794,7 +4817,7 @@ fn match_packed_f64_versioned_loop(
     // loop; call-free read bodies now qualify by the argument above. Every
     // other body keeps the ordinary materialization-hazard gate.
     if ordinary_hoist.is_none() && store_array_kind.is_none() && !read_body_is_safe {
-        return None;
+        return packed_loop_reject("body_not_admissible");
     }
     let binding_is_eligible = if store_array_kind.is_some() || read_body_is_safe {
         // A helper call that produced the binding marks it with the
@@ -4809,7 +4832,7 @@ fn match_packed_f64_versioned_loop(
         packed_loop_array_binding_is_eligible(ctx, hoist.arr_id)
     };
     if !binding_is_eligible {
-        return None;
+        return packed_loop_reject("binding_not_eligible");
     }
     let array_kind = if let Some(store_array_kind) = store_array_kind {
         // The accepted store body is exactly `arr[i] = <numeric expression>`
@@ -4837,14 +4860,14 @@ fn match_packed_f64_versioned_loop(
         // non-packed array fails the guard into the slow clone.)
         PackedNumericLoopKind::F64
     } else {
-        return None;
+        return packed_loop_reject("array_kind_unknown");
     };
     if !local_is_number_array(ctx, hoist.arr_id) {
-        return None;
+        return packed_loop_reject("guard_emit_declined");
     }
     let body_is_supported = store_array_kind.is_some() || read_body_is_safe;
     if !body_is_supported {
-        return None;
+        return packed_loop_reject("clone_not_call_free");
     }
     Some(PackedF64VersionedLoop {
         counter_id: hoist.counter_id,
@@ -4975,6 +4998,15 @@ fn local_is_u32_array(ctx: &FnCtx<'_>, local_id: u32) -> bool {
     )
 }
 
+/// `PERRY_PACKED_LOOP_ABRUPT=0` restores the pre-#9151 behaviour, where any
+/// abrupt statement kept the loop on the generic path.
+fn packed_loop_abrupt_enabled() -> bool {
+    !matches!(
+        std::env::var("PERRY_PACKED_LOOP_ABRUPT").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 fn stmt_is_packed_f64_loop_safe(
     ctx: &FnCtx<'_>,
     stmt: &Stmt,
@@ -5008,11 +5040,33 @@ fn stmt_is_packed_f64_loop_safe(
         // Conservative: a box release clears cells; keep it out of packed
         // f64 loop bodies (it never appears in one today).
         Stmt::ReleaseBoxes(_) => false,
-        Stmt::Return(_)
-        | Stmt::Throw(_)
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::LabeledBreak(_)
+        // Leaving *this* loop early neither calls out nor touches the array, so
+        // the relaxation the caller documents still holds: the entry guard has
+        // already revalidated the receiver, and an iteration that exits simply
+        // performs fewer reads than the guard admitted. `stmt_array_length_effect`
+        // and `stmt_preserves_array_length` already answer `Preserves`/`true`
+        // for these two.
+        //
+        // Unlabeled only. A nested loop is rejected below, so a bare `break` or
+        // `continue` here can only target the loop being analysed, and the fast
+        // clone's exit edge is the right destination. A LABELED break targets an
+        // enclosing loop and must unwind past this one, which the clone does not
+        // do: admitting it made
+        //   outer: for (r…) { for (i…) { s += a[i]; if (a[i] === 10 && r === 2) break outer; } }
+        // return 4032 instead of 4087, silently dropping the partial iteration.
+        Stmt::Break | Stmt::Continue => packed_loop_abrupt_enabled(),
+        // Same argument, once the returned expression itself is safe — it is
+        // evaluated in the loop body like any other operand.
+        Stmt::Return(value) => {
+            packed_loop_abrupt_enabled()
+                && value
+                    .as_ref()
+                    .is_none_or(|expr| expr_is_packed_f64_loop_safe(ctx, expr, arr_id, counter_id))
+        }
+        // `throw` stays out: the thrown value is typically constructed
+        // (`throw new Error(…)`), which is a call in the loop body.
+        Stmt::Throw(_) => packed_loop_abrupt_enabled(),
+        Stmt::LabeledBreak(_)
         | Stmt::LabeledContinue(_)
         | Stmt::While { .. }
         | Stmt::DoWhile { .. }
@@ -5157,7 +5211,7 @@ fn expr_is_packed_f64_loop_safe(
     use perry_hir::{ArrayElement, Expr};
     match expr {
         Expr::IndexGet { object, index } => {
-            is_packed_f64_loop_index(object, index, arr_id, counter_id)
+            is_packed_f64_loop_foreign_read_index(ctx, object, index, arr_id, counter_id)
         }
         // A numeric-store fallback can downgrade/invalidate raw-f64 layout.
         // Without a loop restart, later packed-loop loads would keep using the
@@ -5241,6 +5295,45 @@ fn expr_is_packed_f64_loop_safe(
         | Expr::ArraySplice { .. } => false,
         _ => false,
     }
+}
+
+/// `arr[i]` inside a READ-ONLY matched body where `i` is an i32 counter of an
+/// ENCLOSING loop rather than this loop's own.
+///
+/// The clone's raw slot load is licensed by the counter being the loop's own
+/// induction variable, which its bound proves in range. A foreign index has no
+/// such proof, so the read site pays one inline `icmp ult idx, len` and takes
+/// the fact's existing side exit when it fails — the same mid-body exit the
+/// hole arm already uses.
+///
+/// Read-only bodies only, and that is what calling this from
+/// `expr_is_packed_f64_loop_safe` (never from the store matchers) buys: a side
+/// exit re-executes the iteration in the slow clone, which is harmless for
+/// reads and would double-apply a store. `sum = sum + arr[i] + arr[j]` in
+/// `benchmarks/suite/10_nested_loops.ts` is exactly this shape, and paid two
+/// typed-feedback guard calls plus two boxed fallbacks per iteration for it.
+fn is_packed_f64_loop_foreign_read_index(
+    ctx: &FnCtx<'_>,
+    object: &perry_hir::Expr,
+    index: &perry_hir::Expr,
+    arr_id: u32,
+    counter_id: u32,
+) -> bool {
+    if is_packed_f64_loop_index(object, index, arr_id, counter_id) {
+        return true;
+    }
+    let (perry_hir::Expr::LocalGet(object_id), perry_hir::Expr::LocalGet(index_id)) =
+        (object, index)
+    else {
+        return false;
+    };
+    *object_id == arr_id
+        && *index_id != counter_id
+        && *index_id != arr_id
+        && ctx.integer_locals.contains(index_id)
+        && ctx.i32_counter_slots.contains_key(index_id)
+        && !ctx.boxed_vars.contains(index_id)
+        && !ctx.closure_captures.contains_key(index_id)
 }
 
 fn is_packed_f64_loop_index(
@@ -5504,6 +5597,14 @@ pub(crate) fn lower_for(
     // ctx.locals, which the body can then load via LocalGet.
     if let Some(init_stmt) = init {
         lower_stmt(ctx, init_stmt)?;
+    }
+
+    // #9160: `sum += strings[maskedIndex].length`. A one-time receiver,
+    // window, element-tag, and accumulator check admits a clone whose array
+    // access is a raw boxed-slot load and whose length dispatch is SSO/heap
+    // only. The ordinary loop below remains the semantic fallback.
+    if super::string_length_loop::lower(ctx, init, condition, update, body)? {
+        return Ok(());
     }
 
     // #6809/#6812: validate a dense, same-shape object array once and run a
